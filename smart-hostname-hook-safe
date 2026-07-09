@@ -1,0 +1,1105 @@
+#!/bin/sh
+#
+# smart-hostname-openwrt.sh
+#
+# Improve DHCP client names on OpenWrt using this priority:
+#   0. Existing static dnsmasq/OpenWrt hostname for this MAC or IP
+#   1. Passive mDNS hostname seen with tcpdump for the current IP
+#   2. Last good mDNS hostname cached for this MAC
+#   3. DHCP-supplied hostname
+#   4. Logical device type fallback
+#   5. Generated fallback name based on the MAC address
+#
+# Intended entry points:
+#   - /etc/hotplug.d/dhcp/* on OpenWrt
+#   - dnsmasq dhcp-script, where args are: ACTION MAC IP HOSTNAME
+
+set -u
+
+STATE_DIR="${SMART_HOSTNAME_STATE_DIR:-/tmp/smart-hostname}"
+HOSTS_FILE="${SMART_HOSTNAME_HOSTS_FILE:-$STATE_DIR/hosts}"
+DB_FILE="${SMART_HOSTNAME_DB_FILE:-$STATE_DIR/leases.db}"
+MDNS_CACHE_FILE="${SMART_HOSTNAME_MDNS_CACHE_FILE:-$STATE_DIR/mdns.cache}"
+TYPE_CACHE_FILE="${SMART_HOSTNAME_TYPE_CACHE_FILE:-$STATE_DIR/type.cache}"
+DOMAIN="${SMART_HOSTNAME_DOMAIN:-lan}"
+DRY_RUN="${SMART_HOSTNAME_DRY_RUN:-0}"
+RELOAD_DNSMASQ="${SMART_HOSTNAME_RELOAD_DNSMASQ:-1}"
+RESTART_DNSMASQ_ON_MISS="${SMART_HOSTNAME_RESTART_DNSMASQ_ON_MISS:-0}"
+DNSMASQ_VERIFY_SECONDS="${SMART_HOSTNAME_DNSMASQ_VERIFY_SECONDS:-1}"
+MDNS_TCPDUMP="${SMART_HOSTNAME_MDNS_TCPDUMP:-1}"
+MDNS_TCPDUMP_IFACE="${SMART_HOSTNAME_MDNS_TCPDUMP_IFACE:-br-lan}"
+MDNS_TCPDUMP_SECONDS="${SMART_HOSTNAME_MDNS_TCPDUMP_SECONDS:-6}"
+MDNS_TCPDUMP_PACKETS="${SMART_HOSTNAME_MDNS_TCPDUMP_PACKETS:-80}"
+MDNS_CACHE="${SMART_HOSTNAME_MDNS_CACHE:-1}"
+SUFFIX_AUTO_NAMES="${SMART_HOSTNAME_SUFFIX_AUTO_NAMES:-1}"
+MAC_SUFFIX_HEX="${SMART_HOSTNAME_MAC_SUFFIX_HEX:-4}"
+LOG_TAG="${SMART_HOSTNAME_LOG_TAG:-smart-hostname}"
+CHOSEN_NAME=""
+CHOSEN_SOURCE=""
+CHOSEN_REASON=""
+
+log() {
+	logger -t "$LOG_TAG" "$*" 2>/dev/null || true
+}
+
+have() {
+	command -v "$1" >/dev/null 2>&1
+}
+
+mac_compact() {
+	printf '%s' "$1" | tr -d ':-' | tr 'A-Z' 'a-z'
+}
+
+mac_suffix_len() {
+	compact="$(mac_compact "$1")"
+	len="${2:-4}"
+
+	printf '%s' "$compact" | awk -v len="$len" '
+		{
+			if (len <= 0 || length($0) == 0) {
+				print ""
+			} else if (len >= length($0)) {
+				print $0
+			} else {
+				print substr($0, length($0) - len + 1)
+			}
+		}
+	'
+}
+
+mac_tail() {
+	mac_suffix_len "$1" 6
+}
+
+normalize_mac() {
+	printf '%s' "$1" | tr 'A-Z' 'a-z'
+}
+
+lower_ascii() {
+	printf '%s' "$1" | tr 'A-Z' 'a-z'
+}
+
+sanitize_name() {
+	name="$1"
+	name="$(printf '%s' "$name" | sed 's/[[:space:]_][[:space:]_]*/-/g')"
+	name="$(printf '%s' "$name" | sed 's/\.[Ll][Oo][Cc][Aa][Ll]$//; s/\.[Ll][Aa][Nn]$//')"
+	name="$(printf '%s' "$name" | sed 's/[^A-Za-z0-9-]/-/g; s/--*/-/g; s/^-//; s/-$//')"
+	name="$(printf '%.63s' "$name" | sed 's/-$//')"
+	printf '%s' "$name"
+}
+
+is_bad_name() {
+	check_name="$(lower_ascii "$1")"
+	case "$check_name" in
+		''|'*'|'-'|unknown|unknow|none|null|nil|localhost|local|host|hostname|device|client|dhcp|openwrt|router|gateway|iphone|i-hone|ipad|android|watch|mac|printer|camera|tv)
+			return 0
+			;;
+	esac
+
+	case "$check_name" in
+		[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f])
+			return 0
+			;;
+		device-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]|iphone-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]|i-hone-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]|ipad-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]|android-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]|watch-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]|mac-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]|printer-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]|camera-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]|tv-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]|playstation-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]|nintendo-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]|tuya-[0-9a-f][0-9a-f][0-9a-f][0-9a-f])
+			return 0
+			;;
+		i-hone*)
+			return 0
+			;;
+		ip-[0-9]*|192-168-*|10-*|172-1[6-9]-*|172-2[0-9]-*|172-3[0-1]-*)
+			return 0
+			;;
+	esac
+
+	return 1
+}
+
+name_has_own_mac_suffix() {
+	suffix_mac="$1"
+	suffix_name="$(lower_ascii "$(sanitize_name "$2")")"
+
+	for suffix_len in 4 6 12; do
+		suffix_value="$(mac_suffix_len "$suffix_mac" "$suffix_len")"
+		[ -n "$suffix_value" ] || continue
+
+		case "$suffix_name" in
+			*-"$suffix_value")
+				return 0
+				;;
+		esac
+	done
+
+	return 1
+}
+
+type_label() {
+	label_key="$(lower_ascii "$1")"
+	case "$label_key" in
+		iphone) printf '%s' iPhone ;;
+		ipad) printf '%s' iPad ;;
+		android) printf '%s' Android ;;
+		mac) printf '%s' Mac ;;
+		watch) printf '%s' Watch ;;
+		printer) printf '%s' Printer ;;
+		camera) printf '%s' Camera ;;
+		tv) printf '%s' TV ;;
+		windows) printf '%s' Windows ;;
+		scanner) printf '%s' Scanner ;;
+		speaker) printf '%s' Speaker ;;
+		iot) printf '%s' IoT ;;
+		samsung) printf '%s' Samsung ;;
+		xiaomi) printf '%s' Xiaomi ;;
+		playstation) printf '%s' PlayStation ;;
+		nintendo) printf '%s' Nintendo ;;
+		tuya) printf '%s' Tuya ;;
+		*) printf '%s' "$1" ;;
+	esac
+}
+
+generic_type() {
+	name="$(lower_ascii "$(sanitize_name "$1")")"
+	case "$name" in
+		iphone*|i-hone*) type_label iphone ;;
+		ipad*) type_label ipad ;;
+		android*) type_label android ;;
+		mac|macbook*|mac-mini*|imac*) type_label mac ;;
+		apple-watch*|watch*) type_label watch ;;
+		playstation*|ps4*|ps5*) type_label playstation ;;
+		nintendo*|switch*) type_label nintendo ;;
+		printer*) type_label printer ;;
+		camera*) type_label camera ;;
+		tv*) type_label tv ;;
+		desktop-*|laptop-*|pc-*) printf '%s' "$name" ;;
+		*) printf '%s' '' ;;
+	esac
+}
+
+classify_device_text() {
+	text="$(lower_ascii "$(sanitize_name "$1")")"
+
+	case "$text" in
+		*iphone*|*i-hone*) type_label iphone ;;
+		*ipad*) type_label ipad ;;
+		*android-tv*|*androidtv*|*googlecast*|*chromecast*|*roku*|*webos*|*bravia*|*tizen*) type_label tv ;;
+		*android*) type_label android ;;
+		*windows*|*msft*) type_label windows ;;
+		*macbook*|*imac*|*mac-mini*) type_label mac ;;
+		*sony-interactive*|*playstation*|*ps4*|*ps5*) type_label playstation ;;
+		*nintendo*|*switch*) type_label nintendo ;;
+		*apple*|*airplay*|*companion-link*|*apple-mobdev2*) printf '%s' '' ;;
+		*ipp*|*printer*|*pdl-datastream*|*canon*|*hewlett*|*hp-*|*epson*|*brother*|*xerox*|*zebra*) type_label printer ;;
+		*scanner*) type_label scanner ;;
+		*camera*|*rtsp*|*hikvision*|*dahua*|*reolink*|*axis*|*wyze*) type_label camera ;;
+		*sonos*|*speaker*|*spotify-connect*|*raop*|*alexa*|*echo*) type_label speaker ;;
+		*hap*|*homekit*) printf '%s' '' ;;
+		*tuya*) type_label tuya ;;
+		*esp*|*espressif*|*shelly*|*yeelight*|*iot*) type_label iot ;;
+		*samsung*) type_label samsung ;;
+		*lg-electronics*|*lgwebos*) type_label tv ;;
+		*xiaomi*) type_label xiaomi ;;
+		*hon-hai*|*foxconn*) printf '%s' device ;;
+		*) printf '%s' '' ;;
+	esac
+}
+
+first_device_type() {
+	for raw in "$@"; do
+		type="$(classify_device_text "$raw")"
+		if [ -n "$type" ] && [ "$type" != "device" ]; then
+			printf '%s' "$type"
+			return 0
+		fi
+	done
+
+	return 1
+}
+
+type_from_hint_text() {
+	hint_text="$1"
+
+	detected="$(generic_type "$hint_text")"
+	if [ -n "$detected" ] && [ "$(lower_ascii "$detected")" != "device" ]; then
+		printf '%s' "$detected"
+		return 0
+	fi
+
+	detected="$(classify_device_text "$hint_text")"
+	if [ -n "$detected" ] && [ "$(lower_ascii "$detected")" != "device" ]; then
+		printf '%s' "$detected"
+		return 0
+	fi
+
+	return 1
+}
+
+env_type_from_dhcp() {
+	first_device_type \
+		"${DNSMASQ_VENDOR_CLASS:-}" \
+		"${DNSMASQ_USER_CLASS:-}" \
+		"${DNSMASQ_CLIENT_ID:-}" \
+		"${DNSMASQ_TAGS:-}" \
+		"${DNSMASQ_SUPPLIED_HOSTNAME:-}"
+}
+
+is_locally_administered_mac() {
+	first_octet="$(mac_compact "$1" | awk '{ print substr($0, 1, 2) }')"
+	[ -n "$first_octet" ] || return 1
+
+	value=$((0x$first_octet))
+	[ $((value & 2)) -ne 0 ]
+}
+
+oui_vendor() {
+	mac="$1"
+	is_locally_administered_mac "$mac" && return 1
+
+	prefix="$(mac_compact "$mac" | awk '{ print toupper(substr($0, 1, 6)) }')"
+	[ -n "$prefix" ] || return 1
+
+	for file in \
+		/usr/share/nmap/nmap-mac-prefixes \
+		/usr/share/arp-scan/ieee-oui.txt \
+		/usr/share/ieee-data/oui.txt \
+		/usr/share/misc/oui.txt
+	do
+		[ -f "$file" ] || continue
+		awk -v prefix="$prefix" '
+			BEGIN {
+				dash = substr(prefix, 1, 2) "-" substr(prefix, 3, 2) "-" substr(prefix, 5, 2)
+				colon = substr(prefix, 1, 2) ":" substr(prefix, 3, 2) ":" substr(prefix, 5, 2)
+			}
+			{
+				line = toupper($0)
+				if (line ~ "^" prefix || line ~ "^" dash || line ~ "^" colon) {
+					vendor = $0
+					sub(/^[0-9A-Fa-f:-]+[[:space:]]+/, "", vendor)
+					sub(/^\(hex\)[[:space:]]+/, "", vendor)
+					print vendor
+					exit
+				}
+			}
+		' "$file"
+	done | head -n 1
+}
+
+oui_type_from_mac() {
+	prefix="$(mac_compact "$1" | awk '{ print substr($0, 1, 6) }')"
+	case "$prefix" in
+		00e421) type_label playstation; return 0 ;;
+		7048f7) type_label nintendo; return 0 ;;
+		80647c) type_label tuya; return 0 ;;
+	esac
+
+	vendor="$(oui_vendor "$1" | head -n 1)"
+	[ -n "$vendor" ] || return 1
+	classify_device_text "$vendor"
+}
+
+mdns_tcpdump_capture() {
+	target_ip="$1"
+
+	[ "$MDNS_TCPDUMP" = "1" ] || return 1
+	have tcpdump || return 1
+	have timeout || return 1
+
+	timeout "$MDNS_TCPDUMP_SECONDS" tcpdump -ln -i "$MDNS_TCPDUMP_IFACE" -s 0 -c "$MDNS_TCPDUMP_PACKETS" udp port 5353 and src host "$target_ip" 2>/dev/null || true
+}
+
+mdns_from_tcpdump() {
+	target_ip="$1"
+
+	mdns_tcpdump_capture "$target_ip" | awk '
+		function trim(value) {
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+			return value
+		}
+		function candidate_from_record(value) {
+			sub(/^.*(PTR|SRV|ANY|TXT)[[:space:]]+/, "", value)
+			sub(/^\([A-Z][A-Z]\)\?[[:space:]]+/, "", value)
+			sub(/\.local\..*$/, ".local", value)
+			sub(/\.local$/, "", value)
+			return trim(value)
+		}
+		{
+			count = split($0, records, ",")
+			for (i = 1; i <= count; i++) {
+				record = records[i]
+				if (record !~ /\.local\./) {
+					continue
+				}
+				if (record ~ /\?/) {
+					continue
+				}
+				if (record !~ /(PTR|SRV|ANY|TXT)[[:space:]]/) {
+					continue
+				}
+
+				candidate = candidate_from_record(record)
+				if (candidate == "" || candidate ~ /^_/ || candidate ~ /_/ || candidate ~ /\._/) {
+					continue
+				}
+
+				print candidate
+				exit
+			}
+		}
+	'
+}
+
+mdns_type_from_tcpdump() {
+	target_ip="$1"
+
+	mdns_tcpdump_capture "$target_ip" | while IFS= read -r line; do
+		type="$(classify_device_text "$line")"
+		[ -n "$type" ] && printf '%s\n' "$type"
+	done | awk '
+		NF && !seen[$1]++ {
+			print
+			exit
+		}
+	'
+}
+
+first_good_name() {
+	for raw in "$@"; do
+		name="$(sanitize_name "$raw")"
+		if ! is_bad_name "$name"; then
+			printf '%s' "$name"
+			return 0
+		fi
+	done
+
+	return 1
+}
+
+first_static_name() {
+	for raw in "$@"; do
+		name="$(sanitize_name "$raw")"
+		if [ -n "$name" ]; then
+			printf '%s' "$name"
+			return 0
+		fi
+	done
+
+	return 1
+}
+
+current_db_name_for_mac() {
+	target_mac="$(normalize_mac "$1")"
+	[ -f "$DB_FILE" ] || return 1
+
+	awk -v mac="$target_mac" '
+		tolower($1) == mac && NF >= 3 {
+			print $3
+			exit
+		}
+	' "$DB_FILE"
+}
+
+remember_mdns_name() {
+	[ "$MDNS_CACHE" = "1" ] || return 0
+	[ "$DRY_RUN" = "1" ] && return 0
+
+	cache_mac="$(normalize_mac "$1")"
+	cache_ip="$2"
+	cache_name="$(sanitize_name "$3")"
+
+	if is_bad_name "$cache_name"; then
+		return 0
+	fi
+
+	tmp="$MDNS_CACHE_FILE.$$"
+	if [ -f "$MDNS_CACHE_FILE" ]; then
+		awk -v mac="$cache_mac" 'tolower($1) != mac { print }' "$MDNS_CACHE_FILE" > "$tmp"
+	else
+		: > "$tmp"
+	fi
+
+	printf '%s %s %s\n' "$cache_mac" "$cache_ip" "$cache_name" >> "$tmp"
+	mv "$tmp" "$MDNS_CACHE_FILE"
+}
+
+cached_mdns_name() {
+	[ "$MDNS_CACHE" = "1" ] || return 1
+
+	cache_mac="$(normalize_mac "$1")"
+	[ -f "$MDNS_CACHE_FILE" ] || return 1
+
+	awk -v mac="$cache_mac" '
+		tolower($1) == mac && NF >= 3 {
+			print $3
+			exit
+		}
+	' "$MDNS_CACHE_FILE"
+}
+
+remember_type_for_mac() {
+	[ "$DRY_RUN" = "1" ] && return 0
+
+	cache_mac="$(normalize_mac "$1")"
+	cache_type="$(type_label "$2")"
+
+	[ -n "$cache_mac" ] && [ -n "$cache_type" ] || return 0
+	[ "$(lower_ascii "$cache_type")" != "device" ] || return 0
+
+	tmp="$TYPE_CACHE_FILE.$$"
+	if [ -f "$TYPE_CACHE_FILE" ]; then
+		awk -v mac="$cache_mac" 'tolower($1) != mac { print }' "$TYPE_CACHE_FILE" > "$tmp"
+	else
+		: > "$tmp"
+	fi
+
+	printf '%s %s\n' "$cache_mac" "$cache_type" >> "$tmp"
+	mv "$tmp" "$TYPE_CACHE_FILE"
+}
+
+remember_type_from_name() {
+	cache_mac="$1"
+	cache_name="$2"
+	cache_type="$(type_from_hint_text "$cache_name" | head -n 1)"
+
+	[ -n "$cache_type" ] || return 0
+	remember_type_for_mac "$cache_mac" "$cache_type"
+}
+
+cached_type_for_mac() {
+	cache_mac="$(normalize_mac "$1")"
+	[ -f "$TYPE_CACHE_FILE" ] || return 1
+
+	awk -v mac="$cache_mac" '
+		tolower($1) == mac && NF >= 2 {
+			print $2
+			exit
+		}
+	' "$TYPE_CACHE_FILE"
+}
+
+static_name_from_uci() {
+	target_mac="$(normalize_mac "$1")"
+	target_ip="$2"
+	have uci || return 1
+
+	uci -q show dhcp 2>/dev/null | awk -v target_mac="$target_mac" -v target_ip="$target_ip" '
+		function clean(value) {
+			gsub(/^'\''|'\''$/, "", value)
+			gsub(/^"|"$/, "", value)
+			return value
+		}
+		function mac_matches(value, target, parts, count, i) {
+			value = tolower(value)
+			gsub(/;/, " ", value)
+			count = split(value, parts, /[ ,]+/)
+			for (i = 1; i <= count; i++) {
+				if (parts[i] == target) {
+					return 1
+				}
+			}
+			return 0
+		}
+		/^dhcp\.[^=]+=(host|domain)$/ {
+			section = $0
+			sub(/^dhcp\./, "", section)
+			type = section
+			sub(/^.*=/, "", type)
+			sub(/=(host|domain)$/, "", section)
+			static_section[section] = type
+			next
+		}
+		/^dhcp\.[^.]+\.[^=]+=/ {
+			line = $0
+
+			section = line
+			sub(/^dhcp\./, "", section)
+			sub(/\.[^.=]+=.*/, "", section)
+
+			key = line
+			sub(/^dhcp\.[^.]+\./, "", key)
+			sub(/=.*/, "", key)
+
+			value = line
+			sub(/^[^=]*=/, "", value)
+			prop[section "." key] = clean(value)
+		}
+		END {
+			for (section in static_section) {
+				if (prop[section ".smart_hostname"] == "1") {
+					continue
+				}
+
+				name = prop[section ".name"]
+				if (name == "") {
+					name = prop[section ".hostname"]
+				}
+				if (name == "") {
+					continue
+				}
+
+				mac = prop[section ".mac"]
+				ip = prop[section ".ip"]
+
+				if ((mac != "" && mac_matches(mac, target_mac)) || (ip != "" && ip == target_ip)) {
+					print name
+					exit
+				}
+			}
+		}
+	'
+}
+
+dnsmasq_conf_files() {
+	printf '%s\n' /etc/dnsmasq.conf
+
+	for file in /etc/dnsmasq.d/*; do
+		[ -f "$file" ] || continue
+		printf '%s\n' "$file"
+	done
+}
+
+static_name_from_dnsmasq_conf() {
+	target_mac="$(normalize_mac "$1")"
+	target_ip="$2"
+
+	dnsmasq_conf_files | while IFS= read -r file; do
+		[ -n "$file" ] || continue
+		[ -f "$file" ] || continue
+
+		awk -v target_mac="$target_mac" -v target_ip="$target_ip" '
+			function trim(value) {
+				gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+				return value
+			}
+			function is_mac(value) {
+				return tolower(value) ~ /^([0-9a-f][0-9a-f]:){5}[0-9a-f][0-9a-f]$/
+			}
+			function is_ip(value) {
+				return value ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/
+			}
+			/^[[:space:]]*dhcp-host=/ {
+				line = $0
+				sub(/^[[:space:]]*dhcp-host=/, "", line)
+				count = split(line, parts, ",")
+				name = ""
+				matched = 0
+
+				for (i = 1; i <= count; i++) {
+					value = trim(parts[i])
+					if (tolower(value) == target_mac || value == target_ip) {
+						matched = 1
+					} else if (name == "" && value !~ /:/ && !is_ip(value) && value !~ /^set:/ && value !~ /^tag:/ && value !~ /^id:/ && value !~ /^net:/) {
+						name = value
+					}
+				}
+
+				if (matched && name != "") {
+					print name
+					exit
+				}
+			}
+			/^[[:space:]]*host-record=/ {
+				line = $0
+				sub(/^[[:space:]]*host-record=/, "", line)
+				count = split(line, parts, ",")
+				name = trim(parts[1])
+
+				for (i = 2; i <= count; i++) {
+					if (trim(parts[i]) == target_ip && name != "") {
+						print name
+						exit
+					}
+				}
+			}
+			/^[[:space:]]*address=\// {
+				line = $0
+				sub(/^[[:space:]]*address=\//, "", line)
+				count = split(line, parts, "/")
+
+				if (count >= 2 && parts[count] == target_ip && parts[1] != "") {
+					print parts[1]
+					exit
+				}
+			}
+		' "$file"
+	done | head -n 1
+}
+
+static_hosts_files() {
+	printf '%s\n' /etc/hosts
+
+	have uci || return 0
+	uci -q show dhcp 2>/dev/null | awk -v generated="$HOSTS_FILE" '
+		/\.addnhosts=/ {
+			value = $0
+			sub(/^[^=]*=/, "", value)
+			gsub(/^'\''|'\''$/, "", value)
+			gsub(/^"|"$/, "", value)
+
+			if (value != "" && value != generated) {
+				print value
+			}
+		}
+	'
+}
+
+static_name_from_hosts() {
+	target_ip="$1"
+
+	static_hosts_files | while IFS= read -r file; do
+		[ -n "$file" ] || continue
+		case "$file" in
+			"$HOSTS_FILE"|"$STATE_DIR"/*)
+				continue
+				;;
+		esac
+		[ -f "$file" ] || continue
+
+		awk -v target_ip="$target_ip" '
+			$1 == target_ip && $2 != "" && $2 !~ /^localhost(\.|$)/ {
+				print $2
+				exit
+			}
+		' "$file"
+	done | head -n 1
+}
+
+static_name_for_client() {
+	mac="$1"
+	ip="$2"
+
+	uci_name="$(static_name_from_uci "$mac" "$ip" | head -n 1)"
+	dnsmasq_name="$(static_name_from_dnsmasq_conf "$mac" "$ip" | head -n 1)"
+	hosts_name="$(static_name_from_hosts "$ip" | head -n 1)"
+
+	first_static_name "$uci_name" "$dnsmasq_name" "$hosts_name"
+}
+
+name_taken_by_other_mac() {
+	target_mac="$(normalize_mac "$1")"
+	target_name="$2"
+
+	[ -f "$DB_FILE" ] || return 1
+
+	awk -v mac="$target_mac" -v name="$target_name" '
+		tolower($1) != mac && $3 == name { found = 1 }
+		END { exit(found ? 0 : 1) }
+	' "$DB_FILE"
+}
+
+strip_known_type_mac_suffixes() {
+	name="$(sanitize_name "$1")"
+
+	while :; do
+		case "$(lower_ascii "$name")" in
+			*-[0-9a-f][0-9a-f][0-9a-f][0-9a-f])
+				candidate="${name%-????}"
+				;;
+			*-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f])
+				candidate="${name%-??????}"
+				;;
+			*-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f])
+				candidate="${name%-????????????}"
+				;;
+			*)
+				printf '%s' "$name"
+				return 0
+				;;
+		esac
+
+		if [ -n "$(type_from_hint_text "$candidate" | head -n 1)" ]; then
+			name="$candidate"
+			continue
+		fi
+
+		printf '%s' "$name"
+		return 0
+	done
+}
+
+append_mac_suffix() {
+	mac="$(normalize_mac "$1")"
+	base="$(strip_known_type_mac_suffixes "$2")"
+	len="${3:-$MAC_SUFFIX_HEX}"
+	suffix="$(mac_suffix_len "$mac" "$len")"
+
+	if [ -z "$suffix" ]; then
+		printf '%s' "$base"
+		return 0
+	fi
+
+	case "$base" in
+		*-"$suffix")
+			printf '%s' "$base"
+			return 0
+			;;
+	esac
+
+	max_base=$((63 - ${#suffix} - 1))
+	if [ "$max_base" -gt 0 ]; then
+		base="$(printf "%.${max_base}s" "$base" | sed 's/-$//')"
+	fi
+
+	sanitize_name "$base-$suffix"
+}
+
+auto_unique_name() {
+	mac="$1"
+	ip="$2"
+	base="$3"
+
+	if [ "$SUFFIX_AUTO_NAMES" = "1" ]; then
+		name="$(append_mac_suffix "$mac" "$base" "$MAC_SUFFIX_HEX")"
+	else
+		name="$base"
+	fi
+
+	if name_taken_by_other_mac "$mac" "$name"; then
+		name="$(append_mac_suffix "$mac" "$base" 6)"
+	fi
+
+	if name_taken_by_other_mac "$mac" "$name"; then
+		name="$(append_mac_suffix "$mac" "Device" 12)"
+	fi
+
+	printf '%s' "$name"
+}
+
+detect_device_type() {
+	mac="$1"
+	ip="$2"
+	dhcp_name="$3"
+	current_name="${4:-}"
+	use_mdns_type="${5:-1}"
+
+	for detected in \
+		"$(type_from_hint_text "$dhcp_name")" \
+		"$(type_from_hint_text "$current_name")" \
+		"$(cached_type_for_mac "$mac" | head -n 1)" \
+		"$(env_type_from_dhcp | head -n 1)" \
+		"$(oui_type_from_mac "$mac" | head -n 1)"
+	do
+		if [ -n "$detected" ] && [ "$(lower_ascii "$detected")" != "device" ]; then
+			printf '%s' "$detected"
+			return 0
+		fi
+	done
+
+	if [ "$use_mdns_type" = "1" ]; then
+		detected="$(mdns_type_from_tcpdump "$ip" | head -n 1)"
+		if [ -n "$detected" ] && [ "$(lower_ascii "$detected")" != "device" ]; then
+			printf '%s' "$detected"
+			return 0
+		fi
+	fi
+
+	return 1
+}
+
+known_type_for_client() {
+	mac="$1"
+	ip="$2"
+	dhcp_name="$3"
+	current_name="${4:-}"
+
+	detect_device_type "$mac" "$ip" "$dhcp_name" "$current_name" 0
+}
+
+types_conflict() {
+	left_type="$(lower_ascii "$1")"
+	right_type="$(lower_ascii "$2")"
+
+	[ -n "$left_type" ] || return 1
+	[ -n "$right_type" ] || return 1
+	[ "$left_type" != "$right_type" ]
+}
+
+mdns_candidate_is_safe() {
+	mac="$1"
+	ip="$2"
+	dhcp_name="$3"
+	current_name="$4"
+	candidate_name="$5"
+	candidate_source="$6"
+
+	candidate_type="$(type_from_hint_text "$candidate_name")"
+	known_type="$(known_type_for_client "$mac" "$ip" "$dhcp_name" "$current_name" | head -n 1)"
+
+	if types_conflict "$known_type" "$candidate_type"; then
+		log "$mac $ip source=$candidate_source candidate='$candidate_name' rejected=type-conflict mdns_type='$candidate_type' known_type='$known_type'"
+		return 1
+	fi
+
+	return 0
+}
+
+set_choice() {
+	choice_source="$1"
+	choice_reason="$2"
+	choice_name="$3"
+
+	CHOSEN_SOURCE="$choice_source"
+	CHOSEN_REASON="$choice_reason"
+	CHOSEN_NAME="$choice_name"
+}
+
+choose_name() {
+	mac="$1"
+	ip="$2"
+	dhcp_name="$3"
+
+	current_name="$(current_db_name_for_mac "$mac" | head -n 1)"
+	tcpdump_name="$(mdns_from_tcpdump "$ip" | head -n 1)"
+	tcpdump_good=""
+	mdns_rejected=0
+	dhcp_rejected=0
+
+	if tcpdump_good="$(first_good_name "$tcpdump_name")"; then
+		if mdns_candidate_is_safe "$mac" "$ip" "$dhcp_name" "$current_name" "$tcpdump_good" "mdns"; then
+			remember_mdns_name "$mac" "$ip" "$tcpdump_good"
+			remember_type_from_name "$mac" "$tcpdump_good"
+			set_choice "mdns" "tcpdump" "$(auto_unique_name "$mac" "$ip" "$tcpdump_good")"
+			return 0
+		fi
+
+		mdns_rejected=1
+	fi
+
+	cached_name="$(cached_mdns_name "$mac" | head -n 1)"
+	if cached_good="$(first_good_name "$cached_name")"; then
+		if mdns_candidate_is_safe "$mac" "$ip" "$dhcp_name" "$current_name" "$cached_good" "mdns-cache"; then
+			set_choice "mdns" "last-good-mdns" "$(auto_unique_name "$mac" "$ip" "$cached_good")"
+			return 0
+		fi
+
+		mdns_rejected=1
+	fi
+
+	picked="$(sanitize_name "$dhcp_name")"
+	if [ -n "$picked" ]; then
+		if name_has_own_mac_suffix "$mac" "$picked"; then
+			remember_type_from_name "$mac" "$picked"
+			stripped_picked="$(strip_known_type_mac_suffixes "$picked")"
+			if [ "$stripped_picked" != "$picked" ] && ! is_bad_name "$stripped_picked"; then
+				set_choice "dhcp" "client-hostname-stripped-suffix" "$(auto_unique_name "$mac" "$ip" "$stripped_picked")"
+				return 0
+			else
+				log "$mac $ip source=dhcp candidate='$picked' rejected=self-suffix"
+				dhcp_rejected=1
+			fi
+		elif ! is_bad_name "$picked"; then
+			remember_type_from_name "$mac" "$picked"
+			set_choice "dhcp" "client-hostname" "$(auto_unique_name "$mac" "$ip" "$picked")"
+			return 0
+		fi
+	fi
+
+	if [ "$mdns_rejected" = "1" ] || [ "$dhcp_rejected" = "1" ]; then
+		if current_good="$(first_good_name "$current_name")"; then
+			set_choice "cache" "previous-smart-name" "$(auto_unique_name "$mac" "$ip" "$current_good")"
+			return 0
+		fi
+	fi
+
+	if [ "$mdns_rejected" = "1" ]; then
+		use_mdns_type=0
+	else
+		use_mdns_type=1
+	fi
+
+	detected_type="$(detect_device_type "$mac" "$ip" "$dhcp_name" "$current_name" "$use_mdns_type")"
+	if [ -n "$detected_type" ]; then
+		remember_type_for_mac "$mac" "$detected_type"
+		set_choice "type" "logical-type" "$(auto_unique_name "$mac" "$ip" "$detected_type")"
+	else
+		set_choice "fallback" "no-good-name" "$(auto_unique_name "$mac" "$ip" "Device")"
+	fi
+}
+
+rewrite_db() {
+	tmp="$DB_FILE.$$"
+	mac="$(normalize_mac "$1")"
+	ip="$2"
+	name="$3"
+
+	if [ -f "$DB_FILE" ]; then
+		awk -v mac="$mac" -v ip="$ip" 'tolower($1) != mac && $2 != ip { print }' "$DB_FILE" > "$tmp"
+	else
+		: > "$tmp"
+	fi
+
+	printf '%s %s %s\n' "$mac" "$ip" "$name" >> "$tmp"
+	mv "$tmp" "$DB_FILE"
+}
+
+remove_from_db() {
+	tmp="$DB_FILE.$$"
+	mac="$(normalize_mac "$1")"
+
+	[ -f "$DB_FILE" ] || return 0
+	awk -v mac="$mac" 'tolower($1) != mac { print }' "$DB_FILE" > "$tmp"
+	mv "$tmp" "$DB_FILE"
+}
+
+remove_from_db_by_mac_or_ip() {
+	tmp="$DB_FILE.$$"
+	mac="$(normalize_mac "$1")"
+	ip="$2"
+
+	[ -f "$DB_FILE" ] || return 0
+	awk -v mac="$mac" -v ip="$ip" 'tolower($1) != mac && $2 != ip { print }' "$DB_FILE" > "$tmp"
+	mv "$tmp" "$DB_FILE"
+}
+
+write_generated_hosts_file() {
+	output_file="$1"
+	tmp="$output_file.$$"
+	: > "$tmp"
+
+	if [ -f "$DB_FILE" ]; then
+		awk -v domain="$DOMAIN" '
+			NF >= 3 {
+				print $2 " " $3 " " $3 "." domain
+			}
+		' "$DB_FILE" >> "$tmp"
+	fi
+
+	if cmp -s "$output_file" "$tmp" 2>/dev/null; then
+		rm -f "$tmp"
+		return 1
+	fi
+
+	if [ -f "$output_file" ]; then
+		cat "$tmp" > "$output_file"
+		rm -f "$tmp"
+	else
+		mv "$tmp" "$output_file"
+	fi
+	return 0
+}
+
+rebuild_hosts_file() {
+	mkdir -p "$STATE_DIR"
+	write_generated_hosts_file "$HOSTS_FILE"
+}
+
+dnsmasq_name_resolves() {
+	verify_name="$1"
+	verify_ip="$2"
+
+	[ -n "$verify_name" ] && [ -n "$verify_ip" ] || return 1
+	have nslookup || return 1
+
+	nslookup "$verify_name.$DOMAIN" 127.0.0.1 2>/dev/null | awk -v ip="$verify_ip" '
+		$0 ~ ip {
+			found = 1
+		}
+		END {
+			exit found ? 0 : 1
+		}
+	'
+}
+
+restart_dnsmasq_service() {
+	[ "$RESTART_DNSMASQ_ON_MISS" = "1" ] || return 0
+	[ -x /etc/init.d/dnsmasq ] || return 0
+
+	/etc/init.d/dnsmasq restart >/dev/null 2>&1 || return 0
+	log "source=dnsmasq action=restart-hosts file='$HOSTS_FILE'"
+}
+
+reload_dnsmasq_hosts() {
+	reload_name="${1:-}"
+	reload_ip="${2:-}"
+
+	[ "$RELOAD_DNSMASQ" = "1" ] || return 0
+	have pidof || return 0
+
+	pids="$(pidof dnsmasq 2>/dev/null || true)"
+	[ -n "$pids" ] || return 0
+
+	kill -HUP $pids 2>/dev/null || return 0
+	log "source=dnsmasq action=reload-hosts file='$HOSTS_FILE'"
+
+	[ -n "$reload_name" ] && [ -n "$reload_ip" ] || return 0
+	sleep "$DNSMASQ_VERIFY_SECONDS" 2>/dev/null || true
+
+	if ! dnsmasq_name_resolves "$reload_name" "$reload_ip"; then
+		restart_dnsmasq_service
+	fi
+}
+
+main() {
+	action="${ACTION:-${1:-}}"
+	mac="${MACADDR:-${2:-}}"
+	ip="${IPADDR:-${3:-}}"
+
+	if [ -n "${MACADDR:-}" ] || [ -n "${IPADDR:-}" ]; then
+		dhcp_name="${HOSTNAME:-}"
+	else
+		dhcp_name="${4:-}"
+	fi
+
+	case "$action" in
+		add|update|old|bound|renew) ;;
+		del|remove|deconfig)
+			[ -n "$mac" ] || exit 0
+			if [ "$DRY_RUN" = "1" ]; then
+				log "$mac source=delete action=dry-run"
+				printf '%s\n' "dry-run action=delete mac=$mac"
+				exit 0
+			fi
+			mkdir -p "$STATE_DIR"
+			remove_from_db "$mac"
+			if rebuild_hosts_file; then
+				reload_dnsmasq_hosts
+			fi
+			log "$mac source=delete removed"
+			exit 0
+			;;
+		*) exit 0 ;;
+	esac
+
+	[ -n "$mac" ] && [ -n "$ip" ] || exit 0
+
+	if [ "$DRY_RUN" != "1" ]; then
+		mkdir -p "$STATE_DIR"
+
+		lock_dir="$STATE_DIR/lock"
+		if ! mkdir "$lock_dir" 2>/dev/null; then
+			exit 0
+		fi
+		trap 'rmdir "$lock_dir" 2>/dev/null || true' EXIT INT TERM
+	fi
+
+	static_name="$(static_name_for_client "$mac" "$ip" | head -n 1)"
+	if [ -n "$static_name" ]; then
+		if [ "$DRY_RUN" = "1" ]; then
+			log "$mac $ip source=static name='$static_name' action=dry-run"
+			printf '%s\n' "dry-run action=respect-static mac=$mac ip=$ip source=static name=$static_name"
+			exit 0
+		fi
+
+		remove_from_db_by_mac_or_ip "$mac" "$ip"
+		if rebuild_hosts_file; then
+			reload_dnsmasq_hosts "$static_name" "$ip"
+		fi
+		log "$mac $ip source=static name='$static_name' respected"
+		exit 0
+	fi
+
+	choose_name "$mac" "$ip" "$dhcp_name"
+	name="$CHOSEN_NAME"
+
+	if [ "$DRY_RUN" = "1" ]; then
+		log "$mac $ip source=$CHOSEN_SOURCE dhcp='$dhcp_name' name='$name' reason='$CHOSEN_REASON' action=dry-run"
+		printf '%s\n' "dry-run action=apply mac=$mac ip=$ip source=$CHOSEN_SOURCE reason=$CHOSEN_REASON dhcp=$dhcp_name name=$name"
+		exit 0
+	fi
+
+	rewrite_db "$mac" "$ip" "$name"
+	if rebuild_hosts_file; then
+		reload_dnsmasq_hosts "$name" "$ip"
+	fi
+
+	log "$mac $ip source=$CHOSEN_SOURCE dhcp='$dhcp_name' name='$name' reason='$CHOSEN_REASON'"
+}
+
+main "$@"
